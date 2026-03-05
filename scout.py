@@ -565,14 +565,16 @@ def personalize_paragraph(
 
 def extract_address(client: anthropic.Anthropic, current_text: str, base_url: str):
     """
-    Try to find the company's physical street address.
+    Try to find the company's physical address.
 
-    1. First asks Claude to extract it from the already-scraped website text.
-    2. If not found, specifically fetches /contact and /contact-us pages and
-       tries again on that text.
+    1. Ask Claude to extract from already-scraped text.
+    2. Re-fetch homepage with footer preserved.
+    3. Crawl homepage links to discover real contact/about page URLs.
+    4. Try hardcoded fallback paths (/contact, /get-in-touch, etc.).
+    5. DuckDuckGo web search.
+    6. Final fallback: ask Claude for city/country only (e.g. "Reno, NV").
 
-    Returns a plain address string (e.g. "123 Main St, Denver, CO 80202")
-    or None if no address could be found.
+    Returns an address string or None if no location could be found.
     """
     def _ask_claude_for_address(text: str):
         if not text:
@@ -626,8 +628,35 @@ def extract_address(client: anthropic.Anthropic, current_text: str, base_url: st
     except Exception:
         pass
 
-    # Attempt 2: fetch /contact and /contact-us specifically
-    for path in ("/contact", "/contact-us", "/about-us", "/about"):
+    # Attempt 2a: discover real contact/about links from homepage
+    try:
+        homepage_html_links = fetch_page(base)
+        if homepage_html_links:
+            soup_links = BeautifulSoup(homepage_html_links, "html.parser")
+            keywords = ("contact", "reach", "touch", "find-us", "location", "office", "about")
+            discovered_urls = []
+            for a in soup_links.find_all("a", href=True):
+                href = a["href"]
+                if any(k in href.lower() for k in keywords):
+                    full = href if href.startswith("http") else base + "/" + href.lstrip("/")
+                    if full not in discovered_urls and full != base and full != base + "/":
+                        discovered_urls.append(full)
+            for disc_url in discovered_urls[:6]:
+                html = fetch_page(disc_url)
+                if not html:
+                    continue
+                contact_text = html_to_text(html, max_chars=3000)
+                if len(contact_text) > 100:
+                    address = _ask_claude_for_address(contact_text)
+                    if address:
+                        return address
+    except Exception:
+        pass
+
+    # Attempt 2b: hardcoded path fallback
+    for path in ("/contact", "/contact-us", "/contactus", "/get-in-touch",
+                 "/reach-us", "/find-us", "/about-us", "/about",
+                 "/offices", "/locations"):
         html = fetch_page(base + path)
         if not html:
             continue
@@ -671,6 +700,28 @@ def extract_address(client: anthropic.Anthropic, current_text: str, base_url: st
             if raw.lower() not in ("null", "none", "n/a", ""):
                 if re.search(r'\d', raw) and len(raw) > 10:
                     return raw
+    except Exception:
+        pass
+
+    # Final fallback: ask for city/country if no full street address found
+    # Useful for companies that list only "Belfast, UK" or "Reno, NV" without a street number
+    try:
+        resp = _call_claude(client,
+            model="claude-sonnet-4-6",
+            max_tokens=60,
+            messages=[{
+                "role": "user",
+                "content": (
+                    "What city and country (or US state) is this company based in?\n"
+                    "Return only 'City, State/Country' (e.g. 'Reno, NV' or 'Belfast, UK'). "
+                    "If you cannot determine the city at all, return exactly: null\n\n"
+                    f"Text:\n{current_text[:3000]}"
+                )
+            }]
+        )
+        raw = resp.content[0].text.strip()
+        if raw.lower() not in ("null", "none", "n/a", "") and "," in raw and len(raw) > 4:
+            return raw
     except Exception:
         pass
 
