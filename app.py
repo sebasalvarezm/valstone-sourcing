@@ -270,7 +270,7 @@ def run_scout(url: str, log) -> dict:
     # ── Step 7: Personalize outreach paragraph ────────────────────────────────
     log("Drafting outreach paragraph...")
     base_paragraph = extract_outreach_paragraph(groups[matched_file])
-    personalized   = personalize_paragraph(client, base_paragraph, url, current_text)
+    personalized   = personalize_paragraph(client, base_paragraph, url, current_text, products=current_products)
     log("Outreach paragraph complete.")
 
     return {

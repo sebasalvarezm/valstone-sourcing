@@ -342,28 +342,37 @@ def extract_products(client: anthropic.Anthropic, text: str, label: str) -> list
     if not text:
         return []
 
+    # Use a strict/branded prompt for archived pages (to find named old products)
+    # and a permissive prompt for current pages (to find any product/service name)
+    if "archived" in label:
+        content_prompt = (
+            f"Extract named products and services from this {label} website text.\n"
+            "PRIORITY 1: Proprietary or branded product names — items with a specific name "
+            "the company gave them (e.g. 'ProSuite', 'DataBridge 2.0', 'FieldMotion Go'). "
+            "These are the most valuable.\n"
+            "PRIORITY 2: Specific service lines with a distinct name (e.g. 'Managed Print Service', "
+            "'24/7 Emergency Support Programme').\n"
+            "PRIORITY 3 (fallback only, if nothing else found): A unique company tagline, "
+            "positioning statement, or notable capability that was clearly prominent at the time "
+            "(e.g. 'First cloud-based CAFM for SMEs').\n\n"
+            "Do NOT include: generic categories ('consulting', 'software development', 'support'), "
+            "company name variants, or vague descriptions.\n\n"
+            "Return a JSON array of strings only. No commentary.\n"
+            "If you find nothing specific, return an empty array: []\n\n"
+            f"Text:\n{text}"
+        )
+    else:
+        content_prompt = (
+            f"Extract every distinct product name and service name from this {label} website text.\n"
+            "Return a JSON array of strings only. No commentary, no explanation.\n"
+            "If you find nothing, return an empty array: []\n\n"
+            f"Text:\n{text}"
+        )
+
     resp = _call_claude(client,
         model="claude-sonnet-4-6",
         max_tokens=800,
-        messages=[{
-            "role": "user",
-            "content": (
-                f"Extract named products and services from this {label} website text.\n"
-                "PRIORITY 1: Proprietary or branded product names — items with a specific name "
-                "the company gave them (e.g. 'ProSuite', 'DataBridge 2.0', 'FieldMotion Go'). "
-                "These are the most valuable.\n"
-                "PRIORITY 2: Specific service lines with a distinct name (e.g. 'Managed Print Service', "
-                "'24/7 Emergency Support Programme').\n"
-                "PRIORITY 3 (fallback only, if nothing else found): A unique company tagline, "
-                "positioning statement, or notable capability that was clearly prominent at the time "
-                "(e.g. 'First cloud-based CAFM for SMEs').\n\n"
-                "Do NOT include: generic categories ('consulting', 'software development', 'support'), "
-                "company name variants, or vague descriptions.\n\n"
-                "Return a JSON array of strings only. No commentary.\n"
-                "If you find nothing specific, return an empty array: []\n\n"
-                f"Text:\n{text}"
-            )
-        }]
+        messages=[{"role": "user", "content": content_prompt}]
     )
 
     raw = resp.content[0].text.strip()
@@ -535,27 +544,34 @@ def personalize_paragraph(
     client: anthropic.Anthropic,
     paragraph: str,
     url: str,
-    current_text: str
+    current_text: str,
+    products: list = None
 ) -> str:
     """
-    Ask Claude to add exactly one subtle company-specific reference
-    to the outreach paragraph without rewriting it.
+    Ask Claude to add a company-specific reference to the outreach paragraph.
+    If a product list is provided, Claude is directed to name a specific product.
     """
+    products_hint = ""
+    if products:
+        products_hint = (
+            f"\nThe company's specific named products include: {', '.join(products[:6])}. "
+            "If possible, mention one of these by name rather than describing the company generically.\n"
+        )
+
     resp = _call_claude(client,
         model="claude-sonnet-4-6",
         max_tokens=500,
         messages=[{
             "role": "user",
             "content": (
-                f"Here is an outreach paragraph. Add exactly one natural, subtle reference "
-                f"to the company at {url} — something specific about what they do, "
-                "a market they serve, or a detail from their website.\n\n"
+                f"Here is an outreach paragraph. Add one company-specific reference "
+                f"to the company at {url} that makes it feel written for them specifically.\n"
+                f"{products_hint}\n"
                 "Rules:\n"
                 "- Do NOT rewrite the paragraph\n"
                 "- Do NOT change the structure or length meaningfully\n"
-                "- Do NOT make it sound like a different paragraph\n"
                 "- Keep the tone identical\n"
-                "- Just weave in one small, natural detail that makes it feel less generic\n"
+                "- Prefer mentioning a specific product name or niche market over generic industry descriptions\n"
                 "- Do NOT use em dashes (—) anywhere in the output\n\n"
                 f"PARAGRAPH:\n{paragraph}\n\n"
                 f"COMPANY CONTEXT:\n{current_text[:2500]}\n\n"
