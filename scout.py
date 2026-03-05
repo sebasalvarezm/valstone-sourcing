@@ -742,13 +742,24 @@ def extract_address(client: anthropic.Anthropic, current_text: str, base_url: st
 def search_restaurants(address: str) -> list:
     """
     Search DuckDuckGo for business dinner restaurants near the given address.
+    Uses city+state only (not full street address) for better results.
     Returns a list of result dicts (title, body). Raises on failure.
     """
     from ddgs import DDGS
-    # Use title-case address for better search results; strip postal codes that
-    # can confuse some search engines.
-    search_address = address.title()
-    query = f"best business dinner restaurants near {search_address}"
+
+    # Extract city+state from the address — full street addresses confuse
+    # DuckDuckGo and return unrelated pages. "Hamden, CT" works far better
+    # than "2911 Dixwell Ave, Hamden, CT 06518".
+    parts = [p.strip() for p in address.split(",")]
+    if len(parts) >= 2:
+        # Take last 2 parts (city + state/country), drop street and zip
+        city_state = ", ".join(parts[-2:]).strip()
+        # Strip trailing zip code if present (e.g. "CT 06518" → "CT")
+        city_state = re.sub(r"\s+\d{5}(-\d{4})?$", "", city_state).strip()
+    else:
+        city_state = address
+
+    query = f"fine dining restaurants {city_state} business dinner"
     ddgs = DDGS()
     results = list(ddgs.text(query, max_results=8))
     return results
@@ -777,9 +788,12 @@ def pick_top_restaurants(client: anthropic.Anthropic, search_results: list, addr
             "role": "user",
             "content": (
                 f"Based on these search results for restaurants near {address}, "
-                "pick the 3 best options for a professional business dinner.\n\n"
-                "Return a JSON array of exactly 3 objects. Each object must have:\n"
-                '  "name": restaurant name\n'
+                "pick up to 3 real dine-in restaurants suitable for a professional business dinner.\n\n"
+                "IMPORTANT: If the search results do not contain actual restaurant listings "
+                "(e.g. they are about unrelated products, homepages, or generic pages), "
+                "return an empty array [] — do NOT invent placeholder names or explain why.\n\n"
+                "Return a JSON array of up to 3 objects. Each object must have:\n"
+                '  "name": the actual restaurant name\n'
                 '  "description": one sentence on why it suits a business dinner\n\n'
                 "No commentary, no markdown, no explanation — only the JSON array.\n\n"
                 f"Search results:\n{snippets}"
@@ -789,32 +803,44 @@ def pick_top_restaurants(client: anthropic.Anthropic, search_results: list, addr
 
     raw = resp.content[0].text.strip()
 
+    _bad_name_signals = ("no suitable", "not found", "no restaurant", "cannot",
+                         "unable", "invalid", "no result", "n/a")
+
+    def _is_real_restaurant(r: dict) -> bool:
+        name = r.get("name", "").lower().strip()
+        if not name:
+            return False
+        return not any(sig in name for sig in _bad_name_signals)
+
     # Attempt 1: direct JSON parse (Claude returns a clean array)
     try:
         parsed = json.loads(raw)
         if isinstance(parsed, list):
-            return [
+            results = [
                 {"name": r.get("name", ""), "description": r.get("description", "")}
                 for r in parsed
-                if isinstance(r, dict) and r.get("name")
+                if isinstance(r, dict) and _is_real_restaurant(r)
             ][:3]
+            if results:
+                return results
+            return []  # Claude returned placeholder objects — trigger fallback
     except json.JSONDecodeError:
         pass
 
     # Attempt 2: extract a JSON array-of-objects from prose/markdown wrapper.
-    # Use \[\s*\{ ... \}\s*\] so we only match an array that actually starts
-    # with an object — this avoids accidentally matching things like
-    # "[5 results]" that might appear earlier in Claude's response.
     match = re.search(r"\[\s*\{.*\}\s*\]", raw, re.DOTALL)
     if match:
         try:
             parsed = json.loads(match.group())
             if isinstance(parsed, list):
-                return [
+                results = [
                     {"name": r.get("name", ""), "description": r.get("description", "")}
                     for r in parsed
-                    if isinstance(r, dict) and r.get("name")
+                    if isinstance(r, dict) and _is_real_restaurant(r)
                 ][:3]
+                if results:
+                    return results
+                return []  # placeholder objects — trigger fallback
         except json.JSONDecodeError:
             pass
 
