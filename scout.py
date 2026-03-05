@@ -228,8 +228,8 @@ def get_wayback_candidates(url: str, from_date: str = "20060101", to_date: str =
         "http://web.archive.org/cdx/search/cdx"
         f"?url={domain}&output=json"
         f"&from={from_date}&to={to_date}"
-        "&limit=8&filter=statuscode:200"
-        "&collapse=timestamp:6"
+        "&limit=15&filter=statuscode:200"
+        "&collapse=timestamp:4"
         "&fl=timestamp,original"
     )
 
@@ -711,6 +711,23 @@ def extract_address(client: anthropic.Anthropic, current_text: str, base_url: st
             if raw.lower() not in ("null", "none", "n/a", ""):
                 if re.search(r'\d', raw) and len(raw) > 10:
                     return raw
+            # Street address not found — try extracting just city from these same snippets
+            resp_city = _call_claude(client,
+                model="claude-sonnet-4-6",
+                max_tokens=60,
+                messages=[{
+                    "role": "user",
+                    "content": (
+                        f"What city and state/country is the company {domain} based in?\n"
+                        "Return only 'City, State/Country' (e.g. 'Reno, NV'). "
+                        "If you cannot determine it, return exactly: null\n\n"
+                        f"Search results:\n{snippets[:3000]}"
+                    )
+                }]
+            )
+            raw_city = resp_city.content[0].text.strip()
+            if raw_city.lower() not in ("null", "none", "n/a", "") and "," in raw_city and len(raw_city) > 4:
+                return raw_city
     except Exception:
         pass
 
@@ -1066,7 +1083,9 @@ def main():
             if is_parked_page(old_text_candidate):
                 print(f"         [skip {year}] Looks like a parked or placeholder page.")
                 continue
-            if domain_stem not in old_text_candidate.lower():
+            _text_lower = old_text_candidate.lower()
+            _text_nospace = _text_lower.replace(" ", "").replace("-", "").replace("_", "")
+            if domain_stem not in _text_lower and domain_stem not in _text_nospace:
                 print(f"         [skip {year}] Company name '{domain_stem}' not found — likely a prior domain owner.")
                 continue
 
@@ -1086,36 +1105,49 @@ def main():
             if valid_snapshots_checked >= 3:
                 break  # cap at 3 homepage snapshots
 
-        # Also probe archived interior product pages for richer data
-        interior_paths = ["/products", "/solutions", "/services", "/platform",
-                          "/features", "/software", "/our-products", "/what-we-do"]
+        # Also probe archived interior product pages using CDX prefix discovery
+        # This finds actual URLs like /products.php, /solutions/, /platform/index.html etc.
+        interior_keywords = ["product", "solution", "service", "platform", "feature", "software"]
         interior_checked = 0
-        base_for_interior = url.rstrip("/")
-        for ipath in interior_paths:
+        parsed_base = urlparse(url)
+        domain_only = parsed_base.netloc.replace("www.", "")
+        for ikw in interior_keywords:
             if interior_checked >= 5:
                 break
-            interior_candidates = get_wayback_candidates(
-                base_for_interior + ipath, from_date=wb_from, to_date=wb_to
-            )
-            if not interior_candidates:
+            try:
+                disc_cdx = (
+                    "http://web.archive.org/cdx/search/cdx"
+                    f"?url={domain_only}/{ikw}*&matchType=prefix&output=json"
+                    f"&from={wb_from}&to={wb_to}"
+                    "&limit=3&filter=statuscode:200"
+                    "&collapse=timestamp:4"
+                    "&fl=timestamp,original"
+                )
+                r_disc = requests.get(disc_cdx, timeout=20)
+                r_disc.raise_for_status()
+                disc_data = r_disc.json()
+                if len(disc_data) < 2:
+                    continue
+                for disc_row in disc_data[1:]:
+                    ic_url = f"https://web.archive.org/web/{disc_row[0]}/{disc_row[1]}"
+                    ic_ts = disc_row[0]
+                    ic_html = fetch_page(ic_url, timeout=25)
+                    ic_text = html_to_text(ic_html, max_chars=8000)
+                    if not ic_text or len(ic_text) < 200:
+                        continue
+                    if is_parked_page(ic_text):
+                        continue
+                    print(f"         Interior page snapshot ({disc_row[1]}, {ic_ts[:4]}): {ic_url}")
+                    ic_products = extract_products(client, ic_text, f"archived ({ic_ts[:4]}) interior")
+                    if ic_products:
+                        all_old_products.extend(ic_products)
+                        preview = ", ".join(ic_products[:5])
+                        suffix = "..." if len(ic_products) > 5 else ""
+                        print(f"         Found {len(ic_products)} item(s) on /{ikw}*: {preview}{suffix}")
+                    interior_checked += 1
+                    break  # one snapshot per keyword is enough
+            except Exception:
                 continue
-            # Take the first valid interior snapshot
-            for ic_url, ic_ts in interior_candidates[:3]:
-                ic_html = fetch_page(ic_url, timeout=25)
-                ic_text = html_to_text(ic_html, max_chars=8000)
-                if not ic_text or len(ic_text) < 200:
-                    continue
-                if is_parked_page(ic_text):
-                    continue
-                print(f"         Interior page snapshot ({ipath}, {ic_ts[:4]}): {ic_url}")
-                ic_products = extract_products(client, ic_text, f"archived ({ic_ts[:4]}) interior")
-                if ic_products:
-                    all_old_products.extend(ic_products)
-                    preview = ", ".join(ic_products[:5])
-                    suffix = "..." if len(ic_products) > 5 else ""
-                    print(f"         Found {len(ic_products)} item(s) on {ipath}: {preview}{suffix}")
-                interior_checked += 1
-                break  # one snapshot per subpath is enough
 
         # Deduplicate the combined pool (case-insensitive)
         seen = set()
