@@ -229,6 +229,7 @@ def get_wayback_candidates(url: str, from_date: str = "20060101", to_date: str =
         f"?url={domain}&output=json"
         f"&from={from_date}&to={to_date}"
         "&limit=8&filter=statuscode:200"
+        "&collapse=timestamp:6"
         "&fl=timestamp,original"
     )
 
@@ -347,9 +348,19 @@ def extract_products(client: anthropic.Anthropic, text: str, label: str) -> list
         messages=[{
             "role": "user",
             "content": (
-                f"Extract every distinct product name and service name from this {label} website text.\n"
-                "Return a JSON array of strings only. No commentary, no explanation.\n"
-                "If you find nothing, return an empty array: []\n\n"
+                f"Extract named products and services from this {label} website text.\n"
+                "PRIORITY 1: Proprietary or branded product names — items with a specific name "
+                "the company gave them (e.g. 'ProSuite', 'DataBridge 2.0', 'FieldMotion Go'). "
+                "These are the most valuable.\n"
+                "PRIORITY 2: Specific service lines with a distinct name (e.g. 'Managed Print Service', "
+                "'24/7 Emergency Support Programme').\n"
+                "PRIORITY 3 (fallback only, if nothing else found): A unique company tagline, "
+                "positioning statement, or notable capability that was clearly prominent at the time "
+                "(e.g. 'First cloud-based CAFM for SMEs').\n\n"
+                "Do NOT include: generic categories ('consulting', 'software development', 'support'), "
+                "company name variants, or vague descriptions.\n\n"
+                "Return a JSON array of strings only. No commentary.\n"
+                "If you find nothing specific, return an empty array: []\n\n"
                 f"Text:\n{text}"
             )
         }]
@@ -1015,6 +1026,9 @@ def main():
         print("         No snapshots found in that date range.")
     else:
         print(f"         Found {len(candidates)} candidate snapshot(s) — checking each for valid content...")
+        valid_snapshots_checked = 0
+        all_old_products: list = []
+
         for candidate_url, candidate_ts in candidates:
             year = candidate_ts[:4]
             old_html = fetch_page(candidate_url, timeout=25)
@@ -1030,25 +1044,66 @@ def main():
                 print(f"         [skip {year}] Company name '{domain_stem}' not found — likely a prior domain owner.")
                 continue
 
-            # This candidate passed all checks — use it
-            archive_url = candidate_url
-            timestamp = candidate_ts
-            old_text = old_text_candidate
-            print(f"         Valid snapshot found from {year}: {archive_url}")
-            break
+            # Valid snapshot — use it (keep the first one as the canonical archive_url)
+            if not archive_url:
+                archive_url = candidate_url
+                timestamp = candidate_ts
+                old_text = old_text_candidate
+            print(f"         Valid snapshot found from {year}: {candidate_url}")
+            snapshot_products = extract_products(client, old_text_candidate, f"archived ({year})")
+            if snapshot_products:
+                all_old_products.extend(snapshot_products)
+                preview = ", ".join(snapshot_products[:5])
+                suffix = "..." if len(snapshot_products) > 5 else ""
+                print(f"         Found {len(snapshot_products)} item(s) in {year} snapshot: {preview}{suffix}")
+            valid_snapshots_checked += 1
+            if valid_snapshots_checked >= 3:
+                break  # cap at 3 homepage snapshots
+
+        # Also probe archived interior product pages for richer data
+        interior_paths = ["/products", "/solutions", "/services", "/platform",
+                          "/features", "/software", "/our-products", "/what-we-do"]
+        interior_checked = 0
+        base_for_interior = url.rstrip("/")
+        for ipath in interior_paths:
+            if interior_checked >= 5:
+                break
+            interior_candidates = get_wayback_candidates(
+                base_for_interior + ipath, from_date=wb_from, to_date=wb_to
+            )
+            if not interior_candidates:
+                continue
+            # Take the first valid interior snapshot
+            for ic_url, ic_ts in interior_candidates[:3]:
+                ic_html = fetch_page(ic_url, timeout=25)
+                ic_text = html_to_text(ic_html, max_chars=8000)
+                if not ic_text or len(ic_text) < 200:
+                    continue
+                if is_parked_page(ic_text):
+                    continue
+                print(f"         Interior page snapshot ({ipath}, {ic_ts[:4]}): {ic_url}")
+                ic_products = extract_products(client, ic_text, f"archived ({ic_ts[:4]}) interior")
+                if ic_products:
+                    all_old_products.extend(ic_products)
+                    preview = ", ".join(ic_products[:5])
+                    suffix = "..." if len(ic_products) > 5 else ""
+                    print(f"         Found {len(ic_products)} item(s) on {ipath}: {preview}{suffix}")
+                interior_checked += 1
+                break  # one snapshot per subpath is enough
+
+        # Deduplicate the combined pool (case-insensitive)
+        seen = set()
+        old_products = []
+        for p in all_old_products:
+            key = p.strip().lower()
+            if key and key not in seen:
+                seen.add(key)
+                old_products.append(p.strip())
 
         if not archive_url:
             print("         No valid snapshot passed all checks.")
         else:
-            print(f"         {len(old_text):,} characters extracted from archived page.")
-            print("         Extracting archived products and services...")
-            old_products = extract_products(client, old_text, f"archived ({timestamp[:4]})")
-            if old_products:
-                preview = ", ".join(old_products[:5])
-                suffix = "..." if len(old_products) > 5 else ""
-                print(f"         Found {len(old_products)} item(s): {preview}{suffix}")
-            else:
-                print("         No named products/services found in archived page.")
+            print(f"         Total unique archived items across all snapshots: {len(old_products)}")
 
     # ------------------------------------------------------------------
     # Step 3: Compare old and current — find discontinued product
